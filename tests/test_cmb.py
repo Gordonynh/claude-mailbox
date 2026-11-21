@@ -339,5 +339,11 @@ class TestConfig(Base):
         self.assertNotEqual(p.returncode, 0)
 
 
+    def test_guide_states_mailbox_only_channel(self):
+        out = self.cmb("guide", "alpha-1").stdout
+        self.assertIn("唯一的通信渠道", out)
+        self.assertIn("SendMessage", out)
+        self.assertIn("watch --as alpha-1", out)
+
 if __name__ == "__main__":
     unittest.main()

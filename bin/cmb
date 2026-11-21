@@ -1051,6 +1051,10 @@ def mcp_guide_text(cfg, st, name, channel=False):
         "   已收到 <channel> 推送时不必再挂 Monitor。",
         "3. 空闲等回信：调用 wait 工具，有信即返回全文（约 0.1 秒内）。",
         "",
+        "信箱是唯一的通信渠道：任务、提问、进度和结果都通过信箱发送，不依赖会话结束时自动交回的最终回复"
+        "（Agent 子代理返回报告、侧边会话转述等），也不用 SendMessage。最终回复只写一句「已通过信箱汇报（编号 X）」。"
+        "派活时只以信箱里的信判断下级是否完成，返回值与信件不一致时以信件为准。",
+        "",
         "读信用 unread；需要确认的信用 ack 回复。只发给直属上级、直属下级和同级，其他人请直属上级用 forward 转达；"
         "确有必要越级时设 escalate 并说明原因。部署或占用共享资源前先 claim 并通知，完成后 release 并通知。"
         "信中不写密钥、口令、令牌和个人数据。",
@@ -1076,6 +1080,9 @@ def guide_text(cfg, st, name):
     lines.append("")
     lines.append("请按以下约定工作：")
     lines.append("")
+    lines.append("0. 信箱是唯一的通信渠道：任务、提问、进度和结果都通过下面的命令发信，不依赖会话结束时自动交回的最终回复"
+                 "（Agent 子代理的返回报告、侧边会话的转述等），也不用 SendMessage 联系其他成员。"
+                 "完成后最终回复只写一句「已通过信箱汇报（编号 X）」。你给下级派活时，同样只以信箱里的信判断其完成情况。")
     lines.append("1. 收信监视：现在就用 Monitor 工具运行下面的命令，timeout_ms 设为 1800000，description 写「%s 收件箱」：" % name)
     lines.append("")
     lines.append("       %s watch --as %s" % (cmd, name))
@@ -1283,6 +1290,7 @@ MCP_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 
 MCP_INSTRUCTIONS = """\
 claude-mailbox：与其他 Claude Code 会话分层协作的信箱。
+0. 信箱是成员之间唯一的通信渠道：任务、提问、进度和结果都通过 send/reply/ack 发信，不依赖会话结束时自动交回的最终回复（Agent 子代理返回报告等），也不用 SendMessage；最终回复只写已汇报的信件编号。派活的一方只以信箱里的信判断下级的完成情况。
 1. 先调用 join（member 为你的成员名；如未预设信箱目录，同时给出 root）。
 2. 收信：工作期间用 Monitor 工具挂 join 返回的 watch 命令（timeout_ms 1800000），到期立即重挂；空闲等回信时调用 wait，新信一到即返回全文。
 3. 收到新信用 unread 读取，需要确认的信用 ack 回复。

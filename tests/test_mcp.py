@@ -127,6 +127,7 @@ class TestProtocol(McpBase):
         self.assertEqual(res["protocolVersion"], "2025-06-18")
         self.assertIn("claude/channel", res["capabilities"]["experimental"])
         self.assertIn("join", res["instructions"])
+        self.assertIn("唯一的通信渠道", res["instructions"])
         tools = {t["name"] for t in c.request("tools/list")["result"]["tools"]}
         for name in ("join", "send", "unread", "wait", "ack", "forward", "claim", "release"):
             self.assertIn(name, tools)

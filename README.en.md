@@ -69,6 +69,15 @@ Group recipients: `@parent`, `@children` and `@siblings` are always allowed. `@s
 
 ## Claude Code integration
 
+**The mailbox is the only channel between members.** Tasks, questions, progress, results and acknowledgements all go through the mailbox. Do not rely on Claude Code's built-in return paths:
+
+- A subagent started with the Agent tool hands a final report back to the session that started it, and a side session relays its final reply upward. These bypass the mailbox, so routing rules do not apply and nothing can be traced in the mailbox. A member's final reply should only say "Reported via the mailbox (message X)".
+- The dispatching side judges whether a member is done only from mailbox messages, not from subagent return values or session notifications. If they disagree, the message wins.
+- Do not use `SendMessage` to assign work or chase progress. Write a message instead.
+- To guarantee the mailbox is the only channel, run members as independent sessions or headless processes (`claude -p`) rather than Agent subagents.
+
+The `join` result, the `cmb guide` brief and the skill all state this rule.
+
 Arm a Monitor in each session (`timeout_ms: 1800000`):
 
 ```bash
