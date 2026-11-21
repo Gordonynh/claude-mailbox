@@ -4,11 +4,14 @@
 
 让 2 个到几十个 Claude Code 会话按上下级可靠地互相通信的文件信箱。
 
-同时开多个 Claude Code 会话分工时（一个总指挥、几个组长、一批执行者），会话之间直接传消息常常送不到。claude-mailbox 的做法很朴素：每位成员一个只追加的 Markdown 收件箱，发信由 `cmb` 命令加锁追加，收信由 Claude Code 的 Monitor 工具运行 `cmb watch`，新信一到就推送通知。信件是普通文本文件，人和模型都能直接查看，出问题也容易排查。
+同时开多个 Claude Code 会话分工时（一个总指挥、几个组长、一批执行者），会话之间直接传消息又慢又常常送不到。claude-mailbox 绕开会话间消息机制，直接读写本机文件：每位成员一个只追加的 Markdown 收件箱，发信加锁追加，收信由通道推送、`wait` 工具或 Monitor 即时通知。信件是普通文本文件，人和模型都能直接查看，出问题也容易排查。
 
+它同时提供 **MCP 服务器**（会话里直接调用 `mcp__mailbox__send`、`wait` 等工具）、**Claude Code skill** 和 **`cmb` 命令行**三种接入方式。
+
+- **快**：MCP 工具在服务器进程内完成读写，不另起进程；`wait` 在新信到达后约 0.1 秒内返回；几十个会话同时收发，每封信只需毫秒级。
 - **分层路由**：成员和上下级写在一个配置文件里。默认只能发给直属上级、直属下级和同级，越级要显式加 `--escalate`，避免几十个代理互相乱发。
 - **可靠**：全局 `flock` 锁加原子追加，几十个进程同时写也不丢信、不串号。编号带发信人前缀（`A-12` 表示 alpha 的第 12 封信）。
-- **不漏信**：`watch` 启动时先列出全部未读信件，Monitor 到期重挂的空档里到达的信也会补报。
+- **不漏信**：未读游标按成员保存；`watch` 启动时先列出全部未读信件，Monitor 到期重挂的空档里到达的信也会补报。
 - **可控体积**：收件箱超过设定大小时，自动把已读旧信归档，未读信件从不归档；`unread`、`since`、`inbox` 只读需要的部分。
 - **协作约定**：`claim`/`release` 登记部署、数据库等共享资源的占用，并可同时发信通知。
 - **安全护栏**：发信前拦截常见的密钥、令牌格式。
@@ -21,6 +24,7 @@
 - [成员表](#成员表)
 - [发信与收信](#发信与收信)
 - [接入 Claude Code](#接入-claude-code)
+- [MCP 工具](#mcp-工具)
 - [路由规则](#路由规则)
 - [协作约定](#协作约定)
 - [轮转与归档](#轮转与归档)
@@ -40,15 +44,34 @@ cd claude-mailbox
 `install.sh` 会：
 
 1. 把 `bin/cmb` 链接到 `~/.local/bin/cmb`（可用 `CMB_BIN_DIR` 改位置）；
-2. 把 skill 复制到 `~/.claude/skills/claude-mailbox/SKILL.md`（可用 `CLAUDE_SKILLS_DIR` 改位置），之后每个 Claude Code 会话都会知道如何收发信。
+2. 把 skill 复制到 `~/.claude/skills/session-mailbox/SKILL.md`（可用 `CLAUDE_SKILLS_DIR` 改位置），之后每个 Claude Code 会话都会知道如何收发信。
+
+再注册 MCP 服务器（用户范围，所有项目可用）：
+
+```bash
+./install.sh --mcp
+```
+
+它等同于 `claude mcp add -s user mailbox -- python3 <仓库>/bin/cmb mcp`。只想在某个项目里使用时，可以在该项目的 `.mcp.json` 中写：
+
+```json
+{
+  "mcpServers": {
+    "mailbox": {
+      "command": "python3",
+      "args": ["/path/to/claude-mailbox/bin/cmb", "mcp", "--root", "/path/to/mailbox"]
+    }
+  }
+}
+```
 
 卸载用 `./install.sh --uninstall`。不想安装也可以直接用仓库里的 `bin/cmb`。
 
-也可以作为 Claude Code 插件安装 skill（`cmb` 命令仍需按上面的方式放进 PATH）：
+也可以作为 Claude Code 插件安装。插件同时带上 skill、MCP 服务器，并把 `cmb` 加入 Bash 的 PATH：
 
 ```text
 /plugin marketplace add Gordonynh/claude-mailbox
-/plugin install claude-mailbox@claude-mailbox
+/plugin install session-mailbox@session-mailbox
 ```
 
 ## 快速开始
@@ -152,7 +175,29 @@ cmb mark-read --root $R --as alpha    # 全部标记已读
 
 ## 接入 Claude Code
 
-### 1. 每个会话挂一个收信监视
+每个会话都需要做两件事：加入信箱，并保持能收到新信。收信有三种方式，按环境选择，可以叠加：
+
+| 方式 | 适用环境 | 延迟 | 说明 |
+| --- | --- | --- | --- |
+| 通道推送 | 命令行 `claude`，以开发通道方式启动 | 约 0.3 秒 | 新信以 `<channel>` 消息直接出现在对话中 |
+| `wait` 工具 | 任何接入了 MCP 的会话 | 约 0.1 秒 | 空闲等回信时调用，有信即返回全文 |
+| Monitor + `watch` | 任何会话，包括桌面版 | 约 0.3 秒 | 工作期间保持在线，每 30 分钟重挂一次 |
+
+### 1. 加入信箱
+
+已注册 MCP 服务器的会话调用 `join` 工具（`member` 为成员名，`root` 为信箱目录），返回身份、上下级、收信方式与协作约定。只用命令行时，见下面第 4 节的加入指引。
+
+### 2. 通道推送（命令行）
+
+Claude Code 的通道功能允许 MCP 服务器把消息直接推入会话。`cmb mcp` 默认开启推送；自行注册的服务器需要以开发通道方式启动会话：
+
+```bash
+claude --dangerously-load-development-channels server:mailbox
+```
+
+启动时会出现一次确认对话框。未以这种方式启动时，推送会被 Claude Code 静默忽略，不影响其他功能。目前通道只在交互式命令行会话中生效，无头模式（`-p`）不支持。如不需要推送，可在服务器参数中加 `--no-channel`。
+
+### 3. 收信监视（任何环境）
 
 用 Monitor 工具运行（`timeout_ms` 设为 `1800000`，即上限 30 分钟）：
 
@@ -177,20 +222,50 @@ cmb --root ~/mailboxes/demo monitor-cmds
 
 **Monitor 到期的处理**：Monitor 每次最多运行 30 分钟，到期后必须重挂。`watch` 每次启动都会先列出全部未读信件，所以到期和重挂之间到达的信不会漏。不过前提是会话在空档期间没有把信标记成已读。
 
-### 2. 把加入指引粘贴给新会话
+### 4. 把加入指引粘贴给新会话
 
 ```bash
 cmb --root ~/mailboxes/demo guide beta-2
 ```
 
-生成的指引写明了信箱位置、身份、上下级、监视命令、读信与 ACK 的方法、路由规则、资源占用约定和安全要求，可以直接粘贴到新会话的第一条消息里。安装了 skill 的会话还会自动加载 [`skills/claude-mailbox/SKILL.md`](skills/claude-mailbox/SKILL.md) 里的完整约定。
+生成的指引写明了信箱位置、身份、上下级、监视命令、读信与 ACK 的方法、路由规则、资源占用约定和安全要求，可以直接粘贴到新会话的第一条消息里。安装了 skill 的会话还会自动加载 [`skills/session-mailbox/SKILL.md`](skills/session-mailbox/SKILL.md) 里的完整约定。
 
-### 3. 推荐的派活流程
+### 5. 推荐的派活流程
 
 1. 总指挥用 `cmb init` 建信箱、写成员表。
-2. 总指挥开启组长会话，把 `cmb guide <组长>` 的输出连同任务一起交给组长。
-3. 组长同样为执行者生成指引、开启会话。
-4. 每个会话启动后先挂监视，再开始工作；完成后通过 `@parent` 汇报，等待 ACK。
+2. 总指挥开启组长会话，在任务说明里写明信箱目录和成员名（或附上 `cmb guide <组长>` 的输出）。
+3. 组长同样为执行者开启会话。
+4. 每个会话启动后先 `join` 并确保能收到新信，再开始工作；完成后通过 `@parent` 汇报，空闲时用 `wait` 等待 ACK。
+
+## MCP 工具
+
+`cmb mcp` 是一个 stdio MCP 服务器（同样只用标准库）。每个会话各自启动一个服务器进程，进程内保存该会话的身份，调用之间不需要重复给出信箱目录和成员名。
+
+| 工具 | 作用 |
+| --- | --- |
+| `join` | 以某位成员的身份加入（`member`，可选 `root`） |
+| `whoami` | 当前身份与信箱目录 |
+| `send` | 发信（`to`、`body`，可选 `reply_to`、`tag`、`escalate`） |
+| `reply` / `ack` / `forward` | 回复、确认、转发 |
+| `unread` | 未读信件全文，读后标记已读 |
+| `wait` | 阻塞到有未读信件或超时，有信即返回全文 |
+| `inbox` / `since` / `read` / `thread` / `mark_read` | 回看与标记 |
+| `tree` | 层级与未读数 |
+| `claim` / `release` / `claims` | 共享资源占用 |
+
+服务器参数：
+
+- `--root`：预设信箱目录，也可用环境变量 `CMB_ROOT`，或在 `join` 时给出；
+- `--as`：预设身份，也可用 `CMB_ME`；
+- `--no-channel`：关闭通道推送；
+- `--poll`：`wait` 的检查间隔，默认 0.1 秒。
+
+工具名在会话中显示为 `mcp__mailbox__send` 等。
+
+关于 `wait` 的时长：
+
+- 主会话中超过 2 分钟的工具调用会被 Claude Code 自动转为后台任务，有信时以任务通知返回；
+- 超过 30 分钟没有响应的调用会被中止，所以 `timeout_seconds` 上限为 1500 秒。
 
 ## 路由规则
 
@@ -278,6 +353,7 @@ cmb claims --root $R    # 查看当前占用
 | `thread <编号>` | 回复链 |
 | `mark-read [编号]` | 标记已读 |
 | `watch [--interval 秒] [--duration 秒]` | 收信监视（供 Monitor 使用） |
+| `mcp [--no-channel] [--poll 秒]` | 以 MCP 服务器方式运行 |
 | `monitor-cmds [成员…] [--raw]` | 列出监视命令 |
 | `guide <成员>` | 生成加入指引 |
 | `rotate [--keep N]` | 立即归档已读旧信 |
@@ -294,7 +370,7 @@ python3 -m unittest discover -s tests -v
 examples/demo.sh
 ```
 
-测试覆盖：24 个进程并发写入同一收件箱（期间穿插读取和自动轮转）不丢信、不重号；并发群发；路由许可与越级；回复链；轮转保留未读并可跨归档读取；`watch` 的补报与新信通知；信头注入转义；密钥拦截；资源占用；成员表校验。
+测试覆盖：24 个进程并发写入同一收件箱（期间穿插读取和自动轮转）不丢信、不重号；30 个 MCP 服务器并发收发与广播；`wait` 的返回延迟；通道推送；MCP 握手与错误处理；并发群发；路由许可与越级；回复链；轮转保留未读并可跨归档读取；`watch` 的补报与新信通知；信头注入转义；密钥拦截；资源占用；成员表校验。
 
 ## 许可证
 

@@ -1,11 +1,14 @@
 {
-  "name": "claude-mailbox",
-  "owner": { "name": "Gordonynh" },
+  "name": "session-mailbox",
+  "owner": {
+    "name": "Gordonynh"
+  },
+  "description": "分层文件信箱：让多个 Claude Code 会话快速、可靠地互相通信。",
   "plugins": [
     {
-      "name": "claude-mailbox",
+      "name": "session-mailbox",
       "source": "./",
-      "description": "分层文件信箱：让多个 Claude Code 会话按上下级可靠地互相通信。"
+      "description": "分层文件信箱：MCP 服务器、skill 与 cmb 命令。"
     }
   ]
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 安装 cmb 命令与 Claude Code skill。
 #
-#   ./install.sh            把 bin/cmb 链接到 ~/.local/bin/cmb，并把 skill 复制到 ~/.claude/skills/claude-mailbox
+#   ./install.sh            把 bin/cmb 链接到 ~/.local/bin/cmb，并把 skill 复制到 ~/.claude/skills/session-mailbox
+#   ./install.sh --mcp      同上，并以用户范围注册 MCP 服务器 mailbox（claude mcp add -s user）
 #   ./install.sh --uninstall
 #
 # 可用环境变量改变安装位置：
@@ -12,11 +13,14 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${CMB_BIN_DIR:-$HOME/.local/bin}"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-SKILL_DST="$SKILLS_DIR/claude-mailbox"
+SKILL_DST="$SKILLS_DIR/session-mailbox"
 
 if [ "${1:-}" = "--uninstall" ]; then
   if [ -L "$BIN_DIR/cmb" ]; then rm "$BIN_DIR/cmb"; echo "已移除 $BIN_DIR/cmb"; fi
   if [ -f "$SKILL_DST/SKILL.md" ]; then rm -r "$SKILL_DST"; echo "已移除 $SKILL_DST"; fi
+  if command -v claude >/dev/null 2>&1 && claude mcp get mailbox >/dev/null 2>&1; then
+    claude mcp remove -s user mailbox >/dev/null 2>&1 && echo "已注销 MCP 服务器 mailbox"
+  fi
   exit 0
 fi
 
@@ -32,11 +36,17 @@ chmod +x "$HERE/bin/cmb"
 echo "已链接 $BIN_DIR/cmb → $HERE/bin/cmb"
 
 mkdir -p "$SKILL_DST"
-cp "$HERE/skills/claude-mailbox/SKILL.md" "$SKILL_DST/SKILL.md"
+cp "$HERE/skills/session-mailbox/SKILL.md" "$SKILL_DST/SKILL.md"
 echo "已安装 skill → $SKILL_DST/SKILL.md"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "提示：$BIN_DIR 不在 PATH 中，请把它加入 shell 配置，例如：export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
+if [ "${1:-}" = "--mcp" ]; then
+  command -v claude >/dev/null 2>&1 || { echo "未找到 claude 命令，无法注册 MCP 服务器。" >&2; exit 1; }
+  claude mcp remove -s user mailbox >/dev/null 2>&1 || true
+  claude mcp add -s user mailbox -- python3 "$HERE/bin/cmb" mcp
+  echo "已注册 MCP 服务器 mailbox（用户范围）。会话中先调用 join 工具，并给出 member 与 root。"
+fi
 "$BIN_DIR/cmb" version
