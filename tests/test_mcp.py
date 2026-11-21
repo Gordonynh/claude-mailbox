@@ -282,7 +282,7 @@ class TestScale(McpBase):
         res = [None] * self.N
 
         def w(i):
-            res[i] = workers[i].ok("wait", timeout_seconds=15)
+            res[i] = workers[i].call("wait", timeout_seconds=15, timeout=30)
         ths = [threading.Thread(target=w, args=(i,)) for i in range(self.N)]
         for t in ths:
             t.start()
@@ -290,8 +290,55 @@ class TestScale(McpBase):
         boss.ok("send", to="@children", body="全体注意")
         for t in ths:
             t.join(timeout=20)
-        self.assertTrue(all(r and "全体注意" in r for r in res))
+        bad = [(i, r) for i, r in enumerate(res) if not r or r[1] or "全体注意" not in r[0]]
+        self.assertEqual(bad, [])
 
+
+
+class TestMcpV3(McpBase):
+    def test_wait_holds_reader_lock(self):
+        lead = self.client("lead")
+        th = threading.Thread(target=lambda: lead.call("wait", timeout_seconds=3, timeout=15))
+        th.start()
+        time.sleep(0.5)
+        text, is_err = lead.call("unread")
+        self.assertTrue(is_err)
+        self.assertTrue(text.startswith("已拒绝"), text)
+        th.join()
+        lead.ok("unread")
+
+    def test_cascade_acks_claim_wait(self):
+        lead = self.client("lead")
+        alpha = self.client("alpha")
+        beta = self.client("beta")
+        self.assertIn("逐级下发", lead.ok("send", body="全体通知", cascade=True))
+        lead.ok("send", to="@children", body="请回报")
+        alpha.ok("ack", id="L-2", body="前端好了")
+        text = lead.ok("acks", id="L-2", brief=True)
+        self.assertIn("2 人中已回复 1", text)
+        res = {}
+        th = threading.Thread(target=lambda: res.update(t=lead.ok("acks", id="L-2", wait_seconds=10)))
+        th.start()
+        time.sleep(0.5)
+        beta.ok("reply", id="L-2", body="后端好了")
+        th.join(timeout=20)
+        self.assertTrue(res["t"].startswith("已全部回复"), res["t"])
+        text = lead.ok("acks", id="L-2", wait_seconds=1)
+        self.assertIn("已全部回复", text)
+        lead.ok("send", to="alpha", body="再来一封")
+        text, is_err = lead.call("acks", id="L-3", wait_seconds=1)
+        self.assertFalse(is_err)
+        self.assertTrue(text.startswith("超时"), text)
+        alpha.ok("claim", resource="env", ttl_minutes=5)
+        res2 = {}
+        th = threading.Thread(target=lambda: res2.update(t=beta.ok("claim", resource="env", wait_seconds=10)))
+        th.start()
+        time.sleep(0.6)
+        self.assertIn("排队：beta", lead.ok("claims"))
+        alpha.ok("release", resource="env")
+        th.join(timeout=20)
+        self.assertIn("已登记占用", res2["t"])
+        self.assertIn("beta", lead.ok("claims"))
 
 if __name__ == "__main__":
     unittest.main()

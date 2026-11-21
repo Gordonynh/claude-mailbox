@@ -345,5 +345,163 @@ class TestConfig(Base):
         self.assertIn("SendMessage", out)
         self.assertIn("watch --as alpha-1", out)
 
+
+class TestV3(Base):
+    """阻塞等信、读信锁、逐级下发、回执清点、资源排队与过期、输出格式。"""
+
+    def bg(self, *args):
+        env = dict(os.environ)
+        env.pop("CMB_ROOT", None)
+        env.pop("CMB_ME", None)
+        return subprocess.Popen([sys.executable, CMB] + list(args) + ["--root", self.root],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+    def test_wait_timeout_and_delivery(self):
+        t0 = time.time()
+        p = self.cmb("wait", "--as", "alpha", "--timeout", "1", check=False)
+        self.assertEqual(p.returncode, 6)
+        self.assertIn("超时（退出码 6）", p.stderr)
+        self.assertLess(time.time() - t0, 5)
+        w = self.bg("wait", "--as", "alpha", "--timeout", "20s")
+        time.sleep(0.8)
+        sent = time.time()
+        self.cmb("send", "--as", "lead", "--to", "alpha", "阻塞等信测试")
+        o, e = w.communicate(timeout=30)
+        self.assertEqual(w.returncode, 0, e)
+        self.assertLess(time.time() - sent, 2.5)
+        self.assertTrue(o.startswith("收到新信"), o)
+        self.assertIn("阻塞等信测试", o)
+        self.assertIn("没有未读", self.cmb("unread", "--as", "alpha").stdout)
+
+    def test_reader_lock(self):
+        w = self.bg("wait", "--as", "beta", "--timeout", "4s")
+        time.sleep(0.8)
+        p = self.cmb("unread", "--as", "beta", check=False)
+        self.assertEqual(p.returncode, 7)
+        p = self.cmb("wait", "--as", "beta", "--timeout", "1", check=False)
+        self.assertEqual(p.returncode, 7)
+        self.assertEqual(self.cmb("unread", "--as", "beta", "--peek").returncode, 0)
+        self.assertEqual(self.cmb("unread", "--as", "alpha").returncode, 0)  # 其他成员不受影响
+        w.communicate(timeout=20)
+        self.assertEqual(w.returncode, 6)
+        self.assertEqual(self.cmb("unread", "--as", "beta").returncode, 0)
+
+    def test_peek_then_mark_read(self):
+        self.cmb("send", "--as", "alpha-1", "--to", "alpha", "一")
+        self.cmb("send", "--as", "alpha-1", "--to", "alpha", "二")
+        p = self.cmb("unread", "--as", "alpha", "--peek")
+        self.assertIn("mark-read #2", p.stdout)
+        self.assertIn("二", self.cmb("unread", "--as", "alpha", "--peek").stdout)
+        self.cmb("mark-read", "#1", "--as", "alpha")
+        p = self.cmb("unread", "--as", "alpha")
+        self.assertNotIn("\n一\n", p.stdout)
+        self.assertIn("二", p.stdout)
+
+    def test_ack_does_not_skip_earlier_unread(self):
+        self.cmb("send", "--as", "alpha", "--to", "alpha-1", "较早的信")
+        self.cmb("send", "--as", "alpha", "--to", "alpha-1", "较晚的信")
+        self.cmb("ack", "A-2", "--as", "alpha-1")
+        self.assertIn("较早的信", self.cmb("unread", "--as", "alpha-1").stdout)
+        self.cmb("send", "--as", "alpha", "--to", "alpha-1", "第三封")
+        self.cmb("ack", "A-3", "--as", "alpha-1")
+        self.assertIn("没有未读", self.cmb("unread", "--as", "alpha-1").stdout)
+
+    def test_cascade(self):
+        p = self.cmb("send", "--as", "lead", "--cascade", "全体通知")
+        self.assertIn("逐级下发", p.stdout)
+        for n in ("alpha", "alpha-1", "beta-3"):
+            self.assertRegex(self.inbox_text(n), r"## L-1 · .* · cascade · n:1\n全体通知")
+        self.assertNotIn("escalate", self.inbox_text("alpha-1"))
+        p = self.cmb("send", "--as", "lead", "--cascade", "--to", "alpha", "x", check=False)
+        self.assertEqual(p.returncode, 2)
+        self.cmb("send", "--as", "lead", "--to", "alpha", "请转达")
+        self.cmb("forward", "L-2", "--as", "alpha", "--cascade")
+        self.assertIn("请转达", self.inbox_text("alpha-3"))
+        self.assertNotIn("请转达", self.inbox_text("beta-1"))
+        p = self.cmb("forward", "L-2", "--as", "alpha", check=False)
+        self.assertEqual(p.returncode, 2)
+        p = self.cmb("send", "--as", "alpha-1", "--cascade", "x", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("逐级下发", self.cmb("inbox", "--as", "beta-2").stdout)
+
+    def test_acks(self):
+        self.cmb("send", "--as", "alpha", "--to", "@children", "请回报")
+        self.cmb("ack", "A-1", "--as", "alpha-1", "已完成，结果在 out/a1.txt")
+        self.cmb("unread", "--as", "alpha-2")
+        p = self.cmb("acks", "A-1")
+        first = p.stdout.split("\n")[0]
+        self.assertIn("3 人中已回复 1，已读未回复 1，未读 1", first)
+        self.assertIn("alpha-2（已读）", p.stdout)
+        self.assertIn("alpha-3（未读）", p.stdout)
+        self.assertIn("out/a1.txt", p.stdout)
+        p = self.cmb("acks", "A-1", "--wait", "1s", check=False)
+        self.assertEqual(p.returncode, 6)
+        self.assertTrue(p.stdout.startswith("超时（退出码 6）"), p.stdout)
+        w = self.bg("acks", "A-1", "--wait", "20s", "--brief")
+        time.sleep(0.5)
+        self.cmb("ack", "A-1", "--as", "alpha-2", "好")
+        self.cmb("reply", "A-1", "--as", "alpha-3", "也好了")
+        o, e = w.communicate(timeout=30)
+        self.assertEqual(w.returncode, 0, e)
+        self.assertTrue(o.startswith("已全部回复"), o)
+        self.assertIn("也好了", o)
+
+    def test_claim_ttl(self):
+        self.cmb("claim", "env", "--as", "alpha", "--ttl", "1s")
+        p = self.cmb("claim", "env", "--as", "beta", check=False)
+        self.assertEqual(p.returncode, 5)
+        self.assertIn("剩余", p.stderr)
+        time.sleep(1.3)
+        self.cmb("claim", "env", "--as", "beta", "--ttl", "10m")
+        self.assertIn("beta", self.cmb("claims").stdout)
+        p = self.cmb("claim", "env", "--as", "alpha", "--ttl", "abc", check=False)
+        self.assertEqual(p.returncode, 2)
+
+    def test_claim_queue_fifo_no_overlap(self):
+        self.cmb("claim", "race", "--as", "lead")
+        order = ["alpha", "beta", "alpha-1"]
+        log = os.path.join(self.tmp, "order.log")
+        script = ('"%s" "%s" claim race --root "%s" --as "$1" --wait 30s || exit 9; '
+                  'echo "start $1" >> "%s"; sleep 0.6; echo "end $1" >> "%s"; '
+                  '"%s" "%s" release race --root "%s" --as "$1" >/dev/null')
+        script = script % (sys.executable, CMB, self.root, log, log, sys.executable, CMB, self.root)
+        procs = []
+        for n in order:
+            procs.append(subprocess.Popen(["bash", "-c", script, "_", n], stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True))
+            time.sleep(0.5)
+        self.assertIn("排队：alpha、beta、alpha-1", self.cmb("claims").stdout)
+        self.cmb("release", "race", "--as", "lead")
+        for p in procs:
+            o, e = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, e)
+            self.assertIn("排队", o)
+        with open(log) as f:
+            lines = f.read().split()
+        expect = []
+        for n in order:
+            expect += ["start", n, "end", n]
+        self.assertEqual(lines, expect)
+        self.assertIn("当前没有资源占用", self.cmb("claims").stdout)
+
+    def test_claim_queue_timeout_leaves_queue(self):
+        self.cmb("claim", "race", "--as", "lead")
+        p = self.cmb("claim", "race", "--as", "alpha", "--wait", "1s", check=False)
+        self.assertEqual(p.returncode, 5)
+        self.assertIn("排队", p.stderr)
+        self.assertNotIn("排队：", self.cmb("claims").stdout)
+
+    def test_error_and_permissions_output(self):
+        p = self.cmb("send", "--as", "alpha-1", "--to", "lead", "x", check=False)
+        self.assertTrue(p.stderr.startswith("cmb：已拒绝（退出码 3）："), p.stderr)
+        p = self.cmb("permissions", "--as", "alpha-1")
+        self.assertIn('"allow"', p.stdout)
+        self.assertIn("mcp__mailbox", p.stdout)
+        self.assertIn('"--as"', p.stdout)
+        p = self.cmb("guide", "alpha", "--permissions")
+        self.assertIn("wait --as alpha", p.stdout)
+        self.assertIn("acks", p.stdout)
+        self.assertIn("mcp__mailbox", p.stdout)
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 {
   "name": "session-mailbox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "分层文件信箱：让多个 Claude Code 会话按上下级快速、可靠地互相通信（MCP 服务器 + skill + cmb 命令）。",
   "author": {
     "name": "Gordonynh"
