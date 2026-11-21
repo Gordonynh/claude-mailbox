@@ -1,0 +1,9 @@
+{
+  "name": "claude-mailbox",
+  "version": "0.1.0",
+  "description": "分层文件信箱：让多个 Claude Code 会话按上下级可靠地互相通信（cmb 命令 + 收信 skill）。",
+  "author": { "name": "Gordonynh" },
+  "repository": "https://github.com/Gordonynh/claude-mailbox",
+  "license": "MIT",
+  "keywords": ["multi-agent", "mailbox", "coordination", "monitor"]
+}

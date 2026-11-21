@@ -1,0 +1,1392 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""cmb：claude-mailbox 命令行工具。
+
+基于文件的分层信箱，供多个 Claude Code 会话（或任何进程）互相通信。
+只依赖 Python 3 标准库，支持 macOS 与 Linux。
+
+目录结构（ROOT 为信箱根目录）：
+    ROOT/mailbox.conf          成员表与选项
+    ROOT/inbox/<成员>.md        各成员的收件箱，只追加
+    ROOT/archive/<成员>/*.md    轮转归档
+    ROOT/state/seq/<成员>       该成员已发信件的序号
+    ROOT/state/ord/<成员>       该成员收件箱的投递序号
+    ROOT/state/cursor/<成员>    该成员已读到的投递序号
+    ROOT/state/claims.json     资源占用登记
+    ROOT/.lock                 全局写锁
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import time
+
+VERSION = "0.1.0"
+CONF_NAME = "mailbox.conf"
+
+DEFAULT_OPTIONS = {
+    "rotate_bytes": 262144,
+    "keep": 50,
+    "secret_check": "on",
+}
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{0,11}$")
+ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
+ORD_RE = re.compile(r"^#?([0-9]+)$")
+HEADER_RE = re.compile(
+    r"^## (?P<id>[A-Z][A-Z0-9]*-[0-9]+)"
+    r" · (?P<ts>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r" · (?P<frm>[a-z0-9][a-z0-9_-]*)"
+    r" → (?P<to>[a-z0-9][a-z0-9_,-]*)"
+    r"(?P<rest>(?: · .*)?)$"
+)
+ESCAPE_RE = re.compile(r"^\\*## ")
+UNESCAPE_RE = re.compile(r"^\\+## ")
+
+GROUP_TARGETS = ("@parent", "@children", "@siblings", "@subtree", "@all")
+
+SECRET_PATTERNS = [
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥"),
+    (r"\bAKIA[0-9A-Z]{16}\b", "AWS 访问密钥"),
+    (r"\bgh[pousr]_[A-Za-z0-9]{30,}\b", "GitHub 令牌"),
+    (r"\bgithub_pat_[A-Za-z0-9_]{30,}\b", "GitHub 令牌"),
+    (r"\bsk-[A-Za-z0-9_-]{20,}\b", "API 密钥（sk-…）"),
+    (r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b", "Slack 令牌"),
+    (r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "JWT 令牌"),
+    (r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*\S{6,}", "口令赋值"),
+    (r"(口令|密码|密钥|令牌)\s*[:：=]\s*\S{4,}", "口令赋值"),
+]
+
+EXAMPLE_CONF = """\
+# claude-mailbox 示例层级：1 个总指挥、2 个组长、各带 3 个执行者。
+# 每行一个成员：名称  上级（顶层写 -）  编号前缀（写 - 则自动生成）  角色说明
+
+lead      -      L    总指挥
+alpha     lead   A    前端组组长
+alpha-1   alpha  A1   前端执行者
+alpha-2   alpha  A2   前端执行者
+alpha-3   alpha  A3   前端执行者
+beta      lead   B    后端组组长
+beta-1    beta   B1   后端执行者
+beta-2    beta   B2   后端执行者
+beta-3    beta   B3   后端执行者
+"""
+
+TEMPLATE_CONF = """\
+# claude-mailbox 成员表
+# 每行一个成员：名称  上级（顶层写 -）  编号前缀（写 - 则自动生成）  角色说明
+# 名称只能使用小写字母、数字、- 和 _；编号前缀须以大写字母开头。
+#
+# 可选设置（取消注释即生效）：
+# option rotate_bytes 262144   # 收件箱超过该字节数时，自动归档已读的旧信
+# option keep 50               # 归档时收件箱至少保留的最新信件数
+# option secret_check on       # 发信前检查疑似密钥（on 或 off）
+
+lead  -  L  总指挥
+"""
+
+
+class CmbError(Exception):
+    """可预期的错误；code 为退出码。"""
+
+    def __init__(self, msg, code=1):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+
+def now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def out(text=""):
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def err(text):
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def atomic_write(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def append_bytes(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_int(path):
+    t = read_text(path)
+    if t is None:
+        return None
+    t = t.strip()
+    return int(t) if t.isdigit() else None
+
+
+class FileLock(object):
+    """基于 flock(2) 的排他锁。Python 的 fcntl.flock 在 macOS 与 Linux 上均可用。"""
+
+    def __init__(self, path, shared=False):
+        self.path = path
+        self.shared = shared
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+def default_prefix(name):
+    p = re.sub(r"[^A-Za-z0-9]", "", name).upper()
+    if not p or not p[0].isalpha():
+        p = "M" + p
+    return p[:12]
+
+
+# ---------------------------------------------------------------------------
+# 配置与层级
+# ---------------------------------------------------------------------------
+
+class Member(object):
+    __slots__ = ("name", "parent", "prefix", "role")
+
+    def __init__(self, name, parent, prefix, role):
+        self.name = name
+        self.parent = parent
+        self.prefix = prefix
+        self.role = role
+
+
+class Config(object):
+    def __init__(self, root):
+        self.root = root
+        self.members = {}
+        self.order = []
+        self.options = dict(DEFAULT_OPTIONS)
+        self._load()
+
+    def _load(self):
+        path = os.path.join(self.root, CONF_NAME)
+        text = read_text(path)
+        if text is None:
+            raise CmbError("未找到配置文件 %s。请先运行 cmb init。" % path)
+        prefixes = {}
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            where = "%s 第 %d 行" % (CONF_NAME, lineno)
+            if parts[0] == "option":
+                if len(parts) < 3:
+                    raise CmbError("%s：option 需要键和值。" % where)
+                key, val = parts[1], " ".join(parts[2:]).split("#")[0].strip()
+                if key not in DEFAULT_OPTIONS:
+                    raise CmbError("%s：未知选项 %s。" % (where, key))
+                if isinstance(DEFAULT_OPTIONS[key], int):
+                    if not val.isdigit():
+                        raise CmbError("%s：选项 %s 须为正整数。" % (where, key))
+                    self.options[key] = int(val)
+                else:
+                    self.options[key] = val
+                continue
+            if len(parts) < 3:
+                raise CmbError("%s：成员行格式为「名称 上级 编号前缀 [角色说明]」。" % where)
+            name, parent, prefix = parts[0], parts[1], parts[2]
+            role = " ".join(parts[3:])
+            if not NAME_RE.match(name):
+                raise CmbError("%s：成员名 %s 不合法（只能使用小写字母、数字、- 和 _）。" % (where, name))
+            if name in self.members:
+                raise CmbError("%s：成员 %s 重复。" % (where, name))
+            parent = None if parent == "-" else parent
+            if prefix == "-":
+                prefix = default_prefix(name)
+            if not PREFIX_RE.match(prefix):
+                raise CmbError("%s：编号前缀 %s 不合法（须以大写字母开头，最多 12 位大写字母或数字）。" % (where, prefix))
+            if prefix in prefixes:
+                raise CmbError("%s：编号前缀 %s 已被 %s 使用，请显式指定不同的前缀。" % (where, prefix, prefixes[prefix]))
+            prefixes[prefix] = name
+            self.members[name] = Member(name, parent, prefix, role)
+            self.order.append(name)
+        if self.options["keep"] < 1:
+            raise CmbError("选项 keep 至少为 1。")
+        for m in self.members.values():
+            if m.parent is not None and m.parent not in self.members:
+                raise CmbError("成员 %s 的上级 %s 不存在。" % (m.name, m.parent))
+        for m in self.members.values():
+            seen = set()
+            cur = m
+            while cur.parent is not None:
+                if cur.name in seen:
+                    raise CmbError("成员表存在循环上下级关系（涉及 %s）。" % m.name)
+                seen.add(cur.name)
+                cur = self.members[cur.parent]
+
+    # 层级关系 -------------------------------------------------------------
+    def require(self, name):
+        if not name:
+            raise CmbError("请用 --as <成员名> 指明身份（或设置环境变量 CMB_ME）。")
+        if name not in self.members:
+            raise CmbError("成员 %s 不在 %s 中。" % (name, CONF_NAME))
+        return self.members[name]
+
+    def parent(self, name):
+        return self.members[name].parent
+
+    def children(self, name):
+        return [n for n in self.order if self.members[n].parent == name]
+
+    def siblings(self, name):
+        p = self.members[name].parent
+        return [n for n in self.order if n != name and self.members[n].parent == p]
+
+    def descendants(self, name):
+        res = []
+        stack = list(reversed(self.children(name)))
+        while stack:
+            n = stack.pop()
+            res.append(n)
+            stack.extend(reversed(self.children(n)))
+        return res
+
+    def depth(self, name):
+        d = 0
+        cur = self.members[name]
+        while cur.parent is not None:
+            d += 1
+            cur = self.members[cur.parent]
+        return d
+
+    def is_direct(self, sender, target):
+        """直属上级、直属下级或同级。"""
+        return (target == self.parent(sender)
+                or self.members[target].parent == sender
+                or target in self.siblings(sender))
+
+
+# ---------------------------------------------------------------------------
+# 信件解析
+# ---------------------------------------------------------------------------
+
+class Msg(object):
+    def __init__(self, m, header):
+        self.header = header
+        self.id = m.group("id")
+        self.ts = m.group("ts")
+        self.frm = m.group("frm")
+        self.to = m.group("to").split(",")
+        self.re = None
+        self.fwd = None
+        self.tag = None
+        self.escalate = False
+        self.n = 0
+        for field in m.group("rest").split(" · ")[1:]:
+            if field.startswith("re:"):
+                self.re = field[3:]
+            elif field.startswith("fwd:"):
+                self.fwd = field[4:]
+            elif field.startswith("tag:"):
+                self.tag = field[4:]
+            elif field == "escalate":
+                self.escalate = True
+            elif field.startswith("n:") and field[2:].isdigit():
+                self.n = int(field[2:])
+        self.lines = []
+
+    @property
+    def body(self):
+        lines = list(self.lines)
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+        return "\n".join(UNESCAPE_RE.sub("## ", l) if UNESCAPE_RE.match(l) else l for l in lines)
+
+    def first_line(self, width=60):
+        for l in self.body.split("\n"):
+            l = l.strip()
+            if l:
+                return l if len(l) <= width else l[:width] + "…"
+        return ""
+
+    def to_display(self):
+        if len(self.to) <= 6:
+            return ",".join(self.to)
+        return ",".join(self.to[:5]) + "…（共 %d 人）" % len(self.to)
+
+    def summary(self, cursor=None):
+        parts = ["%s #%d" % (self.id, self.n), self.ts, "%s → %s" % (self.frm, self.to_display())]
+        if self.re:
+            parts.append("回复 " + self.re)
+        if self.fwd:
+            parts.append("转发 " + self.fwd)
+        if self.escalate:
+            parts.append("[越级]")
+        if self.tag:
+            parts.append("[%s]" % self.tag)
+        if cursor is not None and self.n > cursor:
+            parts.append("[未读]")
+        return "  ".join(parts) + "：" + self.first_line()
+
+    def full(self):
+        return self.header + "\n" + self.body
+
+
+def parse_text(text):
+    """返回 (前言行列表, 信件列表)。每封信保留原始行，便于无损轮转。"""
+    pre = []
+    msgs = []
+    cur = None
+    for line in text.split("\n"):
+        m = HEADER_RE.match(line)
+        if m:
+            cur = Msg(m, line)
+            msgs.append(cur)
+        elif cur is None:
+            pre.append(line)
+        else:
+            cur.lines.append(line)
+    return pre, msgs
+
+
+def escape_body(body):
+    return "\n".join("\\" + l if ESCAPE_RE.match(l) else l for l in body.split("\n"))
+
+
+def check_secrets(body):
+    hits = []
+    for pat, label in SECRET_PATTERNS:
+        if re.search(pat, body):
+            if label not in hits:
+                hits.append(label)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# 存储
+# ---------------------------------------------------------------------------
+
+class Store(object):
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.root = cfg.root
+
+    def p(self, *parts):
+        return os.path.join(self.root, *parts)
+
+    def inbox(self, name):
+        return self.p("inbox", name + ".md")
+
+    def archive_dir(self, name):
+        return self.p("archive", name)
+
+    def state(self, kind, name):
+        return self.p("state", kind, name)
+
+    def lock(self, shared=False):
+        return FileLock(self.p(".lock"), shared=shared)
+
+    def ensure_inbox(self, name):
+        path = self.inbox(name)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            append_bytes(path, ("# 收件箱：%s\n\n" % name).encode("utf-8"))
+        return path
+
+    # 读取 --------------------------------------------------------------
+    def inbox_msgs(self, name):
+        text = read_text(self.inbox(name))
+        if text is None:
+            return []
+        return parse_text(text)[1]
+
+    def archive_files(self, name):
+        d = self.archive_dir(name)
+        try:
+            files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
+        except FileNotFoundError:
+            return []
+        return [os.path.join(d, f) for f in files]
+
+    def archive_msgs(self, name):
+        res = []
+        for f in self.archive_files(name):
+            res.extend(parse_text(read_text(f) or "")[1])
+        return res
+
+    def all_msgs(self, name):
+        msgs = self.archive_msgs(name) + self.inbox_msgs(name)
+        msgs.sort(key=lambda x: x.n)
+        return msgs
+
+    def every_msg(self):
+        """整个信箱中的全部信件（按编号去重）。"""
+        seen = {}
+        for name in self.cfg.order:
+            for m in self.all_msgs(name):
+                seen.setdefault(m.id, m)
+        return list(seen.values())
+
+    def find(self, name, ref):
+        """在某成员的信箱中查找信件；ref 为编号（A-12）或投递序号（#37）。"""
+        key = self._ref_key(ref)
+        for m in self.inbox_msgs(name):
+            if key(m):
+                return m
+        for m in self.archive_msgs(name):
+            if key(m):
+                return m
+        return None
+
+    @staticmethod
+    def _ref_key(ref):
+        if ID_RE.match(ref):
+            return lambda m: m.id == ref
+        mo = ORD_RE.match(ref)
+        if mo:
+            n = int(mo.group(1))
+            return lambda m: m.n == n
+        raise CmbError("无法识别的信件编号 %s（应为 A-12 或 #37 形式）。" % ref)
+
+    # 计数器 ------------------------------------------------------------
+    def cursor(self, name):
+        return read_int(self.state("cursor", name)) or 0
+
+    def set_cursor(self, name, n):
+        atomic_write(self.state("cursor", name), "%d\n" % n)
+
+    def last_ord(self, name):
+        v = read_int(self.state("ord", name))
+        if v is None:
+            msgs = self.all_msgs(name)
+            v = max([m.n for m in msgs] or [0])
+        return v
+
+    def next_seq(self, name):
+        path = self.state("seq", name)
+        v = read_int(path)
+        if v is None:
+            prefix = self.cfg.members[name].prefix + "-"
+            v = 0
+            for m in self.every_msg():
+                if m.id.startswith(prefix):
+                    v = max(v, int(m.id[len(prefix):]))
+        v += 1
+        atomic_write(path, "%d\n" % v)
+        return v
+
+    def next_ord(self, name):
+        v = self.last_ord(name) + 1
+        atomic_write(self.state("ord", name), "%d\n" % v)
+        return v
+
+    # 轮转 --------------------------------------------------------------
+    def rotate(self, name, force=False, keep=None):
+        """调用方须持有锁。把已读的旧信移入归档，返回归档的封数。"""
+        path = self.inbox(name)
+        if not os.path.exists(path):
+            return 0
+        if not force and os.path.getsize(path) <= self.cfg.options["rotate_bytes"]:
+            return 0
+        keep = keep if keep is not None else self.cfg.options["keep"]
+        keep = max(1, keep)
+        pre, msgs = parse_text(read_text(path))
+        if len(msgs) <= keep:
+            return 0
+        cursor = self.cursor(name)
+        old = []
+        for m in msgs[:len(msgs) - keep]:
+            if m.n <= cursor:
+                old.append(m)
+            else:
+                break
+        if not old:
+            return 0
+        rest = msgs[len(old):]
+        d = self.archive_dir(name)
+        os.makedirs(d, exist_ok=True)
+        fname = "%010d-%010d.md" % (old[0].n, old[-1].n)
+        lines = ["# 归档：%s（#%d–#%d，%s 归档）" % (name, old[0].n, old[-1].n, now_str()), ""]
+        for m in old:
+            lines.append(m.header)
+            lines.extend(m.lines)
+        atomic_write(os.path.join(d, fname), "\n".join(lines).rstrip("\n") + "\n")
+        lines = list(pre)
+        for m in rest:
+            lines.append(m.header)
+            lines.extend(m.lines)
+        atomic_write(path, "\n".join(lines))
+        return len(old)
+
+    # 发信 --------------------------------------------------------------
+    def deliver(self, sender, targets, body, reply_to=None, fwd=None, tag=None, escalate=False):
+        """调用方须持有锁。返回信件编号。"""
+        mem = self.cfg.members[sender]
+        seq = self.next_seq(sender)
+        msg_id = "%s-%d" % (mem.prefix, seq)
+        ts = now_str()
+        to = ",".join(targets)
+        extra = []
+        if reply_to:
+            extra.append("re:" + reply_to)
+        if fwd:
+            extra.append("fwd:" + fwd)
+        if tag:
+            extra.append("tag:" + tag)
+        if escalate:
+            extra.append("escalate")
+        ebody = escape_body(body.rstrip("\n"))
+        for t in targets:
+            self.ensure_inbox(t)
+            n = self.next_ord(t)
+            header = "## %s · %s · %s → %s" % (msg_id, ts, sender, to)
+            header += "".join(" · " + e for e in extra + ["n:%d" % n])
+            append_bytes(self.inbox(t), (header + "\n" + ebody + "\n\n").encode("utf-8"))
+            self.rotate(t)
+        return msg_id
+
+
+# ---------------------------------------------------------------------------
+# 命令实现
+# ---------------------------------------------------------------------------
+
+def find_root(arg):
+    root = arg or os.environ.get("CMB_ROOT")
+    if root:
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.exists(os.path.join(root, CONF_NAME)):
+            raise CmbError("%s 下没有 %s。请先运行 cmb init %s。" % (root, CONF_NAME, root))
+        return root
+    cur = os.getcwd()
+    while True:
+        for cand in (os.path.join(cur, ".mailbox"), cur):
+            if os.path.exists(os.path.join(cand, CONF_NAME)):
+                return cand
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    raise CmbError("未找到信箱。请用 --root 指定信箱目录，或设置环境变量 CMB_ROOT。")
+
+
+def cmb_invocation():
+    """生成指引里使用的命令名：已在 PATH 中则用 cmb，否则用绝对路径。"""
+    me = os.path.realpath(os.path.abspath(sys.argv[0]))
+    w = shutil.which("cmb")
+    if w and os.path.realpath(w) == me:
+        return "cmb"
+    return me
+
+
+def load(args):
+    root = find_root(getattr(args, "root", None))
+    cfg = Config(root)
+    return cfg, Store(cfg)
+
+
+def me_of(args, cfg):
+    name = getattr(args, "me", None) or os.environ.get("CMB_ME")
+    cfg.require(name)
+    return name
+
+
+def read_body(args):
+    body = getattr(args, "body", None)
+    if body is None or body == "-":
+        if sys.stdin is None or sys.stdin.isatty():
+            raise CmbError("缺少正文：请在命令行给出正文，或用 - 从标准输入读取。")
+        body = sys.stdin.read()
+    if not body.strip():
+        raise CmbError("正文为空。")
+    return body
+
+
+def resolve_targets(cfg, me, spec):
+    res = []
+    for raw in spec:
+        for t in raw.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            if t == "@parent":
+                p = cfg.parent(me)
+                if p is None:
+                    raise CmbError("%s 没有上级。" % me)
+                names = [p]
+            elif t == "@children":
+                names = cfg.children(me)
+                if not names:
+                    raise CmbError("%s 没有直属下级。" % me)
+            elif t == "@siblings":
+                names = cfg.siblings(me)
+                if not names:
+                    raise CmbError("%s 没有同级成员。" % me)
+            elif t == "@subtree":
+                names = cfg.descendants(me)
+                if not names:
+                    raise CmbError("%s 没有下级。" % me)
+            elif t == "@all":
+                names = [n for n in cfg.order if n != me]
+            elif t.startswith("@"):
+                raise CmbError("未知的群组 %s（可用：%s）。" % (t, "、".join(GROUP_TARGETS)))
+            else:
+                cfg.require(t)
+                names = [t]
+            for n in names:
+                if n != me and n not in res:
+                    res.append(n)
+    if not res:
+        raise CmbError("没有收信人。")
+    return res
+
+
+def route_check(cfg, me, targets, escalate, reply_sender=None):
+    bad = [t for t in targets if not cfg.is_direct(me, t) and t != reply_sender]
+    if bad and not escalate:
+        p = cfg.parent(me)
+        hint = ("请写给直属上级 %s，由其转达；" % p) if p else ""
+        raise CmbError(
+            "不允许直接发给 %s：默认只能发给直属上级、直属下级和同级。%s确有必要时加 --escalate，并在正文说明原因。"
+            % ("、".join(bad), hint), code=3)
+    return bool(bad)
+
+
+def secret_gate(cfg, body, allow):
+    if allow or str(cfg.options.get("secret_check")).lower() == "off":
+        return
+    hits = check_secrets(body)
+    if hits:
+        raise CmbError("正文疑似包含%s，已拒绝发送。信中不得写入密钥、口令、令牌或个人数据；如确认是误报，可加 --allow-secret。"
+                       % "、".join(hits), code=4)
+
+
+def clean_tag(tag):
+    if tag is None:
+        return None
+    t = re.sub(r"[\s·]+", "-", tag.strip())
+    return t or None
+
+
+def send_common(args, cfg, st, me, body, targets_spec, reply_to=None, fwd=None, tag=None):
+    secret_gate(cfg, body, getattr(args, "allow_secret", False))
+    with st.lock():
+        reply_sender = None
+        if reply_to:
+            orig = st.find(me, reply_to)
+            if orig is None:
+                raise CmbError("你的收件箱中没有信件 %s。" % reply_to)
+            reply_to = orig.id
+            reply_sender = orig.frm
+            if not targets_spec:
+                targets_spec = [orig.frm]
+        if not targets_spec:
+            raise CmbError("请用 --to 指定收信人。")
+        targets = resolve_targets(cfg, me, targets_spec)
+        esc = route_check(cfg, me, targets, getattr(args, "escalate", False), reply_sender)
+        msg_id = st.deliver(me, targets, body, reply_to=reply_to, fwd=fwd, tag=clean_tag(tag), escalate=esc)
+    out("已投递 %s → %s" % (msg_id, "、".join(targets)))
+    return msg_id
+
+
+def cmd_send(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    send_common(args, cfg, st, me, read_body(args), args.to, reply_to=args.reply_to, tag=args.tag)
+
+
+def cmd_reply(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    send_common(args, cfg, st, me, read_body(args), args.to, reply_to=args.id, tag=args.tag)
+
+
+def cmd_ack(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    orig = st.find(me, args.id)
+    if orig is None:
+        raise CmbError("你的收件箱中没有信件 %s。" % args.id)
+    body = "ACK %s" % orig.id
+    if args.body:
+        body += "\n" + args.body
+    send_common(args, cfg, st, me, body, None, reply_to=orig.id)
+    if st.cursor(me) < orig.n:
+        with st.lock():
+            if st.cursor(me) < orig.n:
+                st.set_cursor(me, orig.n)
+
+
+def cmd_forward(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    orig = st.find(me, args.id)
+    if orig is None:
+        raise CmbError("你的收件箱中没有信件 %s。" % args.id)
+    note = args.body.strip() + "\n\n" if args.body else ""
+    quoted = "\n".join("> " + l for l in orig.body.split("\n"))
+    body = "%s> 转自 %s 的 %s（%s）：\n%s" % (note, orig.frm, orig.id, orig.ts, quoted)
+    send_common(args, cfg, st, me, body, args.to, fwd=orig.id, tag=args.tag)
+
+
+def cmd_inbox(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    msgs = st.all_msgs(me) if args.all else st.inbox_msgs(me)
+    cur = st.cursor(me)
+    unread = sum(1 for m in msgs if m.n > cur)
+    shown = msgs if args.all or args.n <= 0 else msgs[-args.n:]
+    for m in shown:
+        out(m.summary(cur))
+    out("—— %s：显示 %d 封，未读 %d 封，已读至 #%d。" % (me, len(shown), unread, cur))
+
+
+def print_full(msgs):
+    for i, m in enumerate(msgs):
+        if i:
+            out("")
+        out(m.full())
+
+
+def cmd_unread(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    cur = st.cursor(me)
+    msgs = [m for m in st.inbox_msgs(me) if m.n > cur]
+    if not msgs:
+        out("没有未读信件（已读至 #%d）。" % cur)
+        return
+    total = len(msgs)
+    if args.max > 0:
+        msgs = msgs[:args.max]
+    print_full(msgs)
+    out("")
+    rest = total - len(msgs)
+    if not args.peek:
+        with st.lock():
+            if st.cursor(me) < msgs[-1].n:
+                st.set_cursor(me, msgs[-1].n)
+        out("—— 已读至 #%d。%s" % (msgs[-1].n, ("还有 %d 封未读，请再次运行 unread。" % rest) if rest else "请对需要确认的信件回复 ACK。"))
+    else:
+        out("—— 预览 %d 封，未标记已读。" % len(msgs))
+
+
+def cmd_since(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    if ORD_RE.match(args.id):
+        n0 = int(ORD_RE.match(args.id).group(1))
+    else:
+        base = st.find(me, args.id)
+        if base is None:
+            raise CmbError("你的收件箱中没有信件 %s。" % args.id)
+        n0 = base.n
+    msgs = [m for m in st.all_msgs(me) if m.n > n0]
+    if not msgs:
+        out("#%d 之后没有新信。" % n0)
+        return
+    if args.brief:
+        cur = st.cursor(me)
+        for m in msgs:
+            out(m.summary(cur))
+    else:
+        print_full(msgs)
+    if args.mark:
+        with st.lock():
+            if st.cursor(me) < msgs[-1].n:
+                st.set_cursor(me, msgs[-1].n)
+        out("\n—— 已读至 #%d。" % msgs[-1].n)
+
+
+def cmd_read(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    found = []
+    for ref in args.ids:
+        m = st.find(me, ref)
+        if m is None:
+            raise CmbError("你的收件箱中没有信件 %s。" % ref)
+        found.append(m)
+    print_full(found)
+
+
+def cmd_mark_read(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    with st.lock():
+        if args.id:
+            m = st.find(me, args.id)
+            if m is None:
+                raise CmbError("你的收件箱中没有信件 %s。" % args.id)
+            n = m.n
+        else:
+            n = st.last_ord(me)
+        if n > st.cursor(me):
+            st.set_cursor(me, n)
+    out("%s 已读至 #%d。" % (me, max(n, st.cursor(me))))
+
+
+def cmd_thread(args):
+    cfg, st = load(args)
+    allm = {m.id: m for m in st.every_msg()}
+    if args.id not in allm:
+        raise CmbError("信箱中没有信件 %s。" % args.id)
+    cur = allm[args.id]
+    guard = set()
+    while cur.re and cur.re in allm and cur.id not in guard:
+        guard.add(cur.id)
+        cur = allm[cur.re]
+    root_id = cur.id
+    kids = {}
+    for m in allm.values():
+        if m.re:
+            kids.setdefault(m.re, []).append(m)
+    res = []
+    seen = set()
+
+    def walk(i):
+        if i in seen or i not in allm:
+            return
+        seen.add(i)
+        res.append(allm[i])
+        for k in sorted(kids.get(i, []), key=lambda m: (m.ts, m.id)):
+            walk(k.id)
+    walk(root_id)
+    print_full(res)
+
+
+def watch_line(m, me):
+    tip = "回复 %s" % m.re if m.re else ""
+    extra = []
+    if tip:
+        extra.append(tip)
+    if m.fwd:
+        extra.append("转发 %s" % m.fwd)
+    if m.escalate:
+        extra.append("越级")
+    if m.tag:
+        extra.append(m.tag)
+    ext = "（%s）" % "，".join(extra) if extra else ""
+    return "[cmb] %s 新信 %s #%d 来自 %s%s：%s" % (me, m.id, m.n, m.frm, ext, m.first_line(80))
+
+
+def cmd_watch(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    path = st.inbox(me)
+
+    def stop(*_):
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+
+    def sig():
+        try:
+            s = os.stat(path)
+            return (s.st_ino, s.st_size, s.st_mtime_ns)
+        except FileNotFoundError:
+            return None
+
+    def snapshot():
+        with st.lock(shared=True):
+            return st.inbox_msgs(me)
+
+    prev = sig()
+    cur = st.cursor(me)
+    msgs = snapshot()
+    last = max([m.n for m in msgs] or [0])
+    unread = [m for m in msgs if m.n > cur]
+    out("[cmb] %s 开始收信监视（%s）。未读 %d 封，已读至 #%d。" % (me, now_str(), len(unread), cur))
+    if not args.no_catchup and unread:
+        limit = 20
+        for m in unread[:limit]:
+            out(watch_line(m, me))
+        if len(unread) > limit:
+            out("[cmb] 另有 %d 封未读未列出。" % (len(unread) - limit))
+    if unread:
+        out("[cmb] 请运行 unread 阅读未读信件。")
+
+    deadline = time.time() + args.duration if args.duration > 0 else None
+    while True:
+        time.sleep(args.interval)
+        if deadline and time.time() >= deadline:
+            out("[cmb] %s 收信监视按设定时长结束，请重新挂上。" % me)
+            return
+        s = sig()
+        if s == prev:
+            continue
+        prev = s
+        try:
+            msgs = snapshot()
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = [m for m in msgs if m.n > last]
+        for m in new:
+            out(watch_line(m, me))
+        if new:
+            last = max(last, max(m.n for m in new))
+
+
+def cmd_tree(args):
+    cfg, st = load(args)
+
+    def line(name, prefix_str, is_last, depth):
+        m = cfg.members[name]
+        unread = max(0, st.last_ord(name) - st.cursor(name))
+        branch = "" if depth == 0 else ("└─ " if is_last else "├─ ")
+        role = ("  " + m.role) if m.role else ""
+        out("%s%s%s [%s]%s  未读 %d" % (prefix_str, branch, name, m.prefix, role, unread))
+
+    def walk(name, prefix_str, is_last, depth):
+        line(name, prefix_str, is_last, depth)
+        kids = cfg.children(name)
+        child_prefix = prefix_str + ("" if depth == 0 else ("   " if is_last else "│  "))
+        for i, k in enumerate(kids):
+            walk(k, child_prefix, i == len(kids) - 1, depth + 1)
+
+    out("信箱：%s（%d 名成员）" % (cfg.root, len(cfg.members)))
+    for r in [n for n in cfg.order if cfg.members[n].parent is None]:
+        walk(r, "", True, 0)
+
+
+def monitor_command(cfg, name):
+    return "%s --root %s watch --as %s" % (cmb_invocation(), shq(cfg.root), name)
+
+
+def shq(s):
+    if re.match(r"^[A-Za-z0-9_./~:@%+=-]+$", s):
+        return s
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def cmd_monitor_cmds(args):
+    cfg, st = load(args)
+    names = args.names or cfg.order
+    for n in names:
+        cfg.require(n)
+        m = cfg.members[n]
+        out("# %s%s" % (n, ("（%s）" % m.role) if m.role else ""))
+        if args.raw:
+            out("tail -n0 -F %s" % shq(st.inbox(n)))
+        else:
+            out(monitor_command(cfg, n))
+
+
+def guide_text(cfg, st, name):
+    m = cfg.members[name]
+    cmd = "%s --root %s" % (cmb_invocation(), shq(cfg.root))
+    parent = cfg.parent(name)
+    kids = cfg.children(name)
+    sibs = cfg.siblings(name)
+    lines = []
+    lines.append("你已加入一个基于文件的信箱，用于和其他 Claude Code 会话协作。")
+    lines.append("")
+    lines.append("- 信箱目录：%s" % cfg.root)
+    lines.append("- 你的身份：%s%s，编号前缀 %s（你发出的信编号为 %s-1、%s-2……）"
+                 % (name, ("（%s）" % m.role) if m.role else "", m.prefix, m.prefix, m.prefix))
+    lines.append("- 直属上级：%s" % (parent or "无（你是最高层）"))
+    lines.append("- 直属下级：%s" % ("、".join(kids) if kids else "无"))
+    lines.append("- 同级成员：%s" % ("、".join(sibs) if sibs else "无"))
+    lines.append("")
+    lines.append("请按以下约定工作：")
+    lines.append("")
+    lines.append("1. 收信监视：现在就用 Monitor 工具运行下面的命令，timeout_ms 设为 1800000，description 写「%s 收件箱」：" % name)
+    lines.append("")
+    lines.append("       %s watch --as %s" % (cmd, name))
+    lines.append("")
+    lines.append("   Monitor 最多运行 30 分钟。到期通知一到，立即用同一命令重新挂上；重挂时它会先列出期间到达的未读信件，不会漏信。")
+    lines.append("2. 读信：收到「新信」通知后运行")
+    lines.append("")
+    lines.append("       %s unread --as %s" % (cmd, name))
+    lines.append("")
+    lines.append("   需要回看时用 `inbox`（最近信件列表）、`since <编号>`（某封之后的全部信件）或 `read <编号>`。")
+    lines.append("3. 确认：每封要求处理的信都回复 ACK，有结论就写在同一封回信里：")
+    lines.append("")
+    lines.append("       %s ack <编号> --as %s \"简短答复\"" % (cmd, name))
+    lines.append("")
+    lines.append("4. 发信：")
+    lines.append("")
+    if parent:
+        lines.append("       %s send --as %s --to @parent \"向上级汇报的正文\"" % (cmd, name))
+    if kids:
+        lines.append("       %s send --as %s --to @children \"发给全部直属下级的正文\"" % (cmd, name))
+    lines.append("       %s send --as %s --to <成员名> --reply-to <编号> \"正文\"" % (cmd, name))
+    lines.append("")
+    lines.append("   长正文可用 `send ... -` 从标准输入读取（例如配合 heredoc）。")
+    lines.append("5. 路由：只发给直属上级、直属下级和同级。需要联系更高层或其他组的成员时，写给直属上级请其转达"
+                 "（上级用 `forward <编号> --to <成员>` 转发）。确有必要越级时加 --escalate，并在正文说明原因。")
+    lines.append("6. 协作约定：部署、数据迁移、占用共享资源（端口、数据库、测试环境等）之前先登记并通知，完成后释放并再通知：")
+    lines.append("")
+    lines.append("       %s claim <资源名> --as %s --note \"用途\" --notify @parent" % (cmd, name))
+    lines.append("       %s release <资源名> --as %s --notify @parent" % (cmd, name))
+    lines.append("")
+    lines.append("7. 安全：信中不写密钥、口令、令牌和个人数据，只写它们的存放位置或用途。")
+    lines.append("8. 信件只追加，不要手工编辑或删除信箱文件。")
+    return "\n".join(lines)
+
+
+def cmd_guide(args):
+    cfg, st = load(args)
+    name = args.name or getattr(args, "me", None) or os.environ.get("CMB_ME")
+    cfg.require(name)
+    out(guide_text(cfg, st, name))
+
+
+def cmd_rotate(args):
+    cfg, st = load(args)
+    names = [me_of(args, cfg)] if getattr(args, "me", None) or os.environ.get("CMB_ME") else cfg.order
+    total = 0
+    with st.lock():
+        for n in names:
+            c = st.rotate(n, force=True, keep=args.keep)
+            if c:
+                out("%s：归档 %d 封。" % (n, c))
+            total += c
+    out("共归档 %d 封。" % total)
+
+
+def load_claims(st):
+    t = read_text(st.p("state", "claims.json"))
+    if not t:
+        return {}
+    try:
+        return json.loads(t)
+    except ValueError:
+        raise CmbError("state/claims.json 已损坏，请检查后手工修复。")
+
+
+def save_claims(st, claims):
+    atomic_write(st.p("state", "claims.json"), json.dumps(claims, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def claim_desc(res, c):
+    s = "%s：%s 自 %s 起占用" % (res, c["holder"], c["since"])
+    if c.get("expires"):
+        s += "，至 %s 到期" % datetime.datetime.fromtimestamp(c["expires"]).strftime("%Y-%m-%d %H:%M:%S")
+    if c.get("note"):
+        s += "，用途：%s" % c["note"]
+    return s
+
+
+def valid_resource(res):
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$", res):
+        raise CmbError("资源名 %s 不合法（字母、数字、_ . : / -，最长 64 位）。" % res)
+
+
+def cmd_claim(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    valid_resource(args.resource)
+    with st.lock():
+        claims = load_claims(st)
+        c = claims.get(args.resource)
+        if c and c["holder"] != me:
+            expired = c.get("expires") and c["expires"] < time.time()
+            if not expired and not args.force:
+                raise CmbError("无法占用。" + claim_desc(args.resource, c) + "。请等待对方释放，或联系其上级。", code=5)
+        claims[args.resource] = {
+            "holder": me,
+            "since": now_str(),
+            "note": args.note or "",
+            "expires": (time.time() + args.ttl * 60) if args.ttl else None,
+        }
+        save_claims(st, claims)
+    out("已登记占用 " + claim_desc(args.resource, claims[args.resource]) + "。")
+    if args.notify:
+        body = "开始占用 %s。%s完成后会再通知。" % (args.resource, ("用途：%s。" % args.note) if args.note else "")
+        send_common(args, cfg, st, me, body, args.notify, tag="claim:" + args.resource)
+
+
+def cmd_release(args):
+    cfg, st = load(args)
+    me = me_of(args, cfg)
+    valid_resource(args.resource)
+    with st.lock():
+        claims = load_claims(st)
+        c = claims.get(args.resource)
+        if not c:
+            raise CmbError("%s 当前无人占用。" % args.resource)
+        if c["holder"] != me and not args.force:
+            raise CmbError("%s 由 %s 占用，你无法释放（必要时加 --force）。" % (args.resource, c["holder"]), code=5)
+        del claims[args.resource]
+        save_claims(st, claims)
+    out("已释放 %s。" % args.resource)
+    if args.notify:
+        body = "已完成并释放 %s。%s" % (args.resource, args.body or "")
+        send_common(args, cfg, st, me, body.strip(), args.notify, tag="release:" + args.resource)
+
+
+def cmd_claims(args):
+    cfg, st = load(args)
+    claims = load_claims(st)
+    if not claims:
+        out("当前没有资源占用。")
+        return
+    for res in sorted(claims):
+        c = claims[res]
+        flag = "（已过期）" if c.get("expires") and c["expires"] < time.time() else ""
+        out(claim_desc(res, c) + flag)
+
+
+def cmd_init(args):
+    root = os.path.abspath(os.path.expanduser(args.dir))
+    conf = os.path.join(root, CONF_NAME)
+    if os.path.exists(conf) and not args.force:
+        raise CmbError("%s 已存在。如需覆盖成员表请加 --force（不会删除已有信件）。" % conf)
+    if args.conf:
+        text = read_text(os.path.abspath(os.path.expanduser(args.conf)))
+        if text is None:
+            raise CmbError("找不到成员表文件 %s。" % args.conf)
+    elif args.example:
+        text = EXAMPLE_CONF
+    else:
+        text = TEMPLATE_CONF
+    os.makedirs(root, exist_ok=True)
+    for d in ("inbox", "archive", "state/seq", "state/ord", "state/cursor"):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    with FileLock(os.path.join(root, ".lock")):
+        atomic_write(conf, text)
+        try:
+            cfg = Config(root)
+        except CmbError:
+            os.unlink(conf)
+            raise
+        st = Store(cfg)
+        for n in cfg.order:
+            st.ensure_inbox(n)
+    out("已初始化信箱：%s（%d 名成员）" % (root, len(cfg.members)))
+    out("下一步：")
+    out("  查看层级        %s --root %s tree" % (cmb_invocation(), shq(root)))
+    out("  生成加入指引    %s --root %s guide <成员名>" % (cmb_invocation(), shq(root)))
+    out("  列出监视命令    %s --root %s monitor-cmds" % (cmb_invocation(), shq(root)))
+
+
+def cmd_add(args):
+    cfg, st = load(args)
+    if not NAME_RE.match(args.name):
+        raise CmbError("成员名 %s 不合法。" % args.name)
+    parent = args.parent or "-"
+    prefix = args.prefix or "-"
+    role = args.role or ""
+    line = "%s  %s  %s  %s" % (args.name, parent, prefix, role)
+    conf = os.path.join(cfg.root, CONF_NAME)
+    with st.lock():
+        old = read_text(conf) or ""
+        new = old if old.endswith("\n") or not old else old + "\n"
+        new += line.rstrip() + "\n"
+        atomic_write(conf, new)
+        try:
+            cfg2 = Config(cfg.root)
+        except CmbError:
+            atomic_write(conf, old)
+            raise
+        Store(cfg2).ensure_inbox(args.name)
+    m = cfg2.members[args.name]
+    out("已加入成员 %s（上级 %s，编号前缀 %s）。" % (m.name, m.parent or "无", m.prefix))
+
+
+def cmd_version(args):
+    out("cmb %s" % VERSION)
+
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--root", help="信箱目录（默认取环境变量 CMB_ROOT，或从当前目录向上查找 .mailbox/）")
+    common.add_argument("--as", dest="me", help="以哪位成员的身份操作（默认取环境变量 CMB_ME）")
+
+    sendopts = argparse.ArgumentParser(add_help=False)
+    sendopts.add_argument("--escalate", action="store_true", help="允许越级发送（会在信头标记 escalate）")
+    sendopts.add_argument("--allow-secret", action="store_true", help="跳过疑似密钥检查（仅在确认误报时使用）")
+
+    p = argparse.ArgumentParser(
+        prog="cmb",
+        description="claude-mailbox：供多个 Claude Code 会话分层协作的文件信箱。",
+        epilog="详细说明见 README.md。各子命令可用 -h 查看帮助。")
+    p.add_argument("--root", dest="g_root", metavar="ROOT", help="信箱目录（也可写在子命令之后）")
+    p.add_argument("--as", dest="g_me", metavar="NAME", help="成员身份（也可写在子命令之后）")
+    p.add_argument("--version", action="version", version="cmb " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="<命令>")
+
+    def add(name, func, help_, parents=(common,)):
+        sp = sub.add_parser(name, help=help_, description=help_, parents=list(parents))
+        sp.set_defaults(func=func)
+        return sp
+
+    sp = add("init", cmd_init, "初始化信箱目录", parents=())
+    sp.add_argument("dir", help="信箱目录")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--example", action="store_true", help="使用内置示例层级（1 个总指挥、2 个组长、各带 3 个执行者）")
+    g.add_argument("--conf", help="从已有成员表文件初始化")
+    sp.add_argument("--force", action="store_true", help="覆盖已有成员表（不删除信件）")
+
+    sp = add("add", cmd_add, "向成员表加入一名成员")
+    sp.add_argument("name", help="成员名")
+    sp.add_argument("--parent", help="上级成员名（不填则为顶层）")
+    sp.add_argument("--prefix", help="编号前缀（不填则自动生成）")
+    sp.add_argument("--role", help="角色说明")
+
+    add("tree", cmd_tree, "显示层级与各成员未读数")
+
+    sp = add("send", cmd_send, "发信", parents=(common, sendopts))
+    sp.add_argument("--to", action="append", help="收信人，可重复或用逗号分隔；可用 @parent @children @siblings @subtree @all")
+    sp.add_argument("--reply-to", help="回复的信件编号；未给 --to 时自动发给原发信人")
+    sp.add_argument("--tag", help="标签，例如 deploy-start、deploy-done")
+    sp.add_argument("body", nargs="?", help="正文；写 - 或省略则从标准输入读取")
+
+    sp = add("reply", cmd_reply, "回复某封信（默认发给原发信人）", parents=(common, sendopts))
+    sp.add_argument("id", help="被回复的信件编号")
+    sp.add_argument("--to", action="append", help="另行指定收信人")
+    sp.add_argument("--tag", help="标签")
+    sp.add_argument("body", nargs="?", help="正文；写 - 或省略则从标准输入读取")
+
+    sp = add("ack", cmd_ack, "回复 ACK 并标记已读", parents=(common, sendopts))
+    sp.add_argument("id", help="确认的信件编号")
+    sp.add_argument("body", nargs="?", help="可选的简短答复")
+
+    sp = add("forward", cmd_forward, "把收件箱中的一封信转给他人（用于逐级转达）", parents=(common, sendopts))
+    sp.add_argument("id", help="要转发的信件编号")
+    sp.add_argument("--to", action="append", required=True, help="收信人")
+    sp.add_argument("--tag", help="标签")
+    sp.add_argument("body", nargs="?", help="转发附言")
+
+    sp = add("inbox", cmd_inbox, "列出收件箱中最近的信件（只列信头）")
+    sp.add_argument("-n", type=int, default=20, help="显示最近几封（默认 20，0 为全部）")
+    sp.add_argument("--all", action="store_true", help="包括归档")
+
+    sp = add("unread", cmd_unread, "显示未读信件全文并标记已读")
+    sp.add_argument("--peek", action="store_true", help="只预览，不标记已读")
+    sp.add_argument("--max", type=int, default=20, help="一次最多显示几封（默认 20，0 为不限）")
+
+    sp = add("since", cmd_since, "显示某封信（编号或 #序号）之后的全部信件，包括归档")
+    sp.add_argument("id", help="信件编号，例如 A-12 或 #37")
+    sp.add_argument("--brief", action="store_true", help="只列信头")
+    sp.add_argument("--mark", action="store_true", help="同时标记为已读")
+
+    sp = add("read", cmd_read, "显示指定信件全文")
+    sp.add_argument("ids", nargs="+", help="信件编号")
+
+    sp = add("mark-read", cmd_mark_read, "标记已读（默认全部）")
+    sp.add_argument("id", nargs="?", help="已读至哪封信")
+
+    sp = add("thread", cmd_thread, "显示与某封信相关的整个回复链")
+    sp.add_argument("id", help="信件编号")
+
+    sp = add("watch", cmd_watch, "持续监视收件箱，每封新信输出一行（供 Monitor 使用）")
+    sp.add_argument("--interval", type=float, default=1.0, help="轮询间隔秒数（默认 1）")
+    sp.add_argument("--duration", type=float, default=0, help="运行多少秒后自动退出（默认不限）")
+    sp.add_argument("--no-catchup", action="store_true", help="启动时不列出未读信件")
+
+    sp = add("monitor-cmds", cmd_monitor_cmds, "列出每位成员的 Monitor 命令")
+    sp.add_argument("names", nargs="*", help="只列这些成员")
+    sp.add_argument("--raw", action="store_true", help="列出 tail -F 形式的命令")
+
+    sp = add("guide", cmd_guide, "生成可直接粘贴给新会话的加入指引")
+    sp.add_argument("name", nargs="?", help="成员名（默认取 --as）")
+
+    sp = add("rotate", cmd_rotate, "立即归档已读的旧信（不加 --as 则处理全部成员）")
+    sp.add_argument("--keep", type=int, help="收件箱至少保留的最新信件数（默认取 option keep）")
+
+    sp = add("claim", cmd_claim, "登记占用共享资源（部署、数据库、端口等）", parents=(common, sendopts))
+    sp.add_argument("resource", help="资源名，例如 deploy、db-staging")
+    sp.add_argument("--note", help="用途说明")
+    sp.add_argument("--ttl", type=float, help="多少分钟后自动过期")
+    sp.add_argument("--force", action="store_true", help="强行接管他人的占用")
+    sp.add_argument("--notify", action="append", help="同时发信通知，例如 @parent 或 @siblings")
+
+    sp = add("release", cmd_release, "释放占用的共享资源", parents=(common, sendopts))
+    sp.add_argument("resource", help="资源名")
+    sp.add_argument("--force", action="store_true", help="释放他人的占用")
+    sp.add_argument("--notify", action="append", help="同时发信通知")
+    sp.add_argument("body", nargs="?", help="随通知附上的说明")
+
+    add("claims", cmd_claims, "列出当前的资源占用")
+    add("version", cmd_version, "显示版本", parents=())
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args, extra = parser.parse_known_args(argv)
+    # 旧版 argparse（Python 3.11 及以前）不能把选项之后的第二个位置参数识别为正文，这里补上。
+    if extra:
+        if (len(extra) == 1 and not extra[0].startswith("-")
+                and hasattr(args, "body") and args.body is None):
+            args.body = extra[0]
+        else:
+            parser.error("无法识别的参数：%s" % " ".join(extra))
+    for k in ("root", "me"):
+        if getattr(args, k, None) is None and getattr(args, "g_" + k, None) is not None:
+            setattr(args, k, getattr(args, "g_" + k))
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    try:
+        args.func(args)
+    except CmbError as e:
+        err("cmb：" + str(e))
+        return e.code
+    except BrokenPipeError:
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

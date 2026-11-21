@@ -1,0 +1,94 @@
+# claude-mailbox
+
+[中文](README.md)
+
+A file-based, hierarchical mailbox that lets anywhere from 2 to several dozen Claude Code sessions talk to each other reliably.
+
+When you run many Claude Code sessions in parallel (one lead, a few group leads, a set of workers), direct cross-session messages often fail to arrive. claude-mailbox takes a simple approach. Each member has an append-only Markdown inbox, and the `cmb` command appends messages under a lock. Each session runs `cmb watch` in Claude Code's Monitor tool, so it gets a notification as soon as a new message lands. Messages are plain text files that both people and models can inspect directly.
+
+- **Hierarchical routing.** You declare members and reporting lines in one config file. By default a member can only write to its direct parent, its direct children and its siblings. Skipping levels requires an explicit `--escalate`.
+- **Reliable under concurrency.** A global `flock` plus single-write appends means dozens of concurrent writers neither lose messages nor duplicate IDs. Each ID carries the sender's prefix: `A-12` is alpha's 12th message.
+- **No missed mail.** `watch` lists every unread message on startup, so mail that arrived while a Monitor was expired and not yet re-armed is still reported.
+- **Bounded size.** When an inbox grows past a configured size, read messages are moved to an archive. Unread messages are never archived. The `unread`, `since` and `inbox` commands read only what they need.
+- **Coordination.** `claim` and `release` record who holds a shared resource (a deploy, a staging database, a port) and can notify others at the same time.
+- **Secret guard.** Common key and token formats are rejected before sending.
+- **Zero dependencies.** A single Python 3 file using only the standard library (Python 3.8+). It runs on macOS and Linux.
+
+## Install
+
+```bash
+git clone https://github.com/Gordonynh/claude-mailbox.git
+cd claude-mailbox
+./install.sh          # links bin/cmb into ~/.local/bin and installs the skill into ~/.claude/skills
+```
+
+You can also add the skill as a Claude Code plugin with `/plugin marketplace add Gordonynh/claude-mailbox`. The `cmb` command still needs to be on your PATH.
+
+## Quick start
+
+```bash
+cmb init ~/mailboxes/demo --example        # 1 lead, 2 group leads, 3 workers each
+cmb --root ~/mailboxes/demo tree
+cmb --root ~/mailboxes/demo guide alpha-1  # paste the output into the alpha-1 session
+```
+
+`mailbox.conf`, one member per line:
+
+```text
+# name     parent  prefix  role
+lead      -      L    Lead
+alpha     lead   A    Frontend group lead
+alpha-1   alpha  A1   Frontend worker
+option rotate_bytes 262144
+option keep 50
+```
+
+## Sending and reading
+
+```bash
+R=~/mailboxes/demo
+cmb send --root $R --as alpha --to alpha-1 "Please build the order page."
+cmb send --root $R --as alpha --to @children "Submit by 18:00."
+cmb send --root $R --as alpha-1 --to @parent "Order page done."
+cmb reply A1-1 --root $R --as alpha "Merged."     # goes to the original sender
+cmb ack A-1 --root $R --as alpha-1 "Started."
+cmb unread --root $R --as alpha                    # full text of unread mail, then marks read
+cmb inbox  --root $R --as alpha                    # recent headers
+cmb since A1-3 --root $R --as alpha                # everything after a message, archives included
+cmb thread A1-1 --root $R
+```
+
+Group recipients: `@parent`, `@children` and `@siblings` are always allowed. `@subtree` and `@all` require `--escalate`.
+
+## Claude Code integration
+
+Arm a Monitor in each session (`timeout_ms: 1800000`):
+
+```bash
+cmb --root ~/mailboxes/demo watch --as alpha-1
+```
+
+Each new message produces exactly one line, and therefore one notification. A Monitor runs for at most 30 minutes, so re-arm it as soon as it expires. Because `watch` reports all unread mail on startup, nothing is lost in the gap. `cmb monitor-cmds` prints the command for every member. `cmb guide <member>` prints a ready-to-paste onboarding brief. The skill in [`skills/claude-mailbox/SKILL.md`](skills/claude-mailbox/SKILL.md) teaches sessions the full protocol: receiving mail, replying with ACK, re-arming the Monitor and catching up on missed mail.
+
+## Rules and conventions
+
+- **Relay, don't skip levels.** A worker that needs the lead writes to its group lead. The group lead relays the message with `cmb forward <id> --to lead`. Replies to any message you received are always allowed.
+- **Announce shared-resource use.** Claim the resource and notify before you start, then release it and notify when you finish:
+  `cmb claim deploy --as beta --note "release v2" --notify @parent`, then `cmb release deploy --as beta --notify @parent "done"`.
+- **Never put secrets or personal data in messages.** The built-in check is a guardrail, not a guarantee.
+- **Do not edit mailbox files by hand.** Use `cmb rotate` to clean up.
+- **Pass `--root` and `--as` on every command.** Each Bash call in Claude Code starts a fresh shell, so environment variables do not persist.
+- **Keep the mailbox on a local disk.** `flock` may be unreliable on NFS, SMB or cloud-synced folders. Windows is not supported; use WSL.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 routing denied, 4 suspected secret, 5 resource held by someone else.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+examples/demo.sh
+```
+
+## License
+
+[MIT](LICENSE)

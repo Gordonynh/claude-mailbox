@@ -1,0 +1,11 @@
+{
+  "name": "claude-mailbox",
+  "owner": { "name": "Gordonynh" },
+  "plugins": [
+    {
+      "name": "claude-mailbox",
+      "source": "./",
+      "description": "分层文件信箱：让多个 Claude Code 会话按上下级可靠地互相通信。"
+    }
+  ]
+}
