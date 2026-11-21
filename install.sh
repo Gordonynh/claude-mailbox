@@ -20,7 +20,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-command -v python3 >/dev/null 2>&1 || { echo "需要 python3（3.8 或更高版本）。" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "需要 python3（3.9 或更高版本）。" >&2; exit 1; }
 
 mkdir -p "$BIN_DIR"
 if [ -e "$BIN_DIR/cmb" ] && [ ! -L "$BIN_DIR/cmb" ]; then

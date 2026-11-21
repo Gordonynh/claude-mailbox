@@ -12,7 +12,7 @@ When you run many Claude Code sessions in parallel (one lead, a few group leads,
 - **Bounded size.** When an inbox grows past a configured size, read messages are moved to an archive. Unread messages are never archived. The `unread`, `since` and `inbox` commands read only what they need.
 - **Coordination.** `claim` and `release` record who holds a shared resource (a deploy, a staging database, a port) and can notify others at the same time.
 - **Secret guard.** Common key and token formats are rejected before sending.
-- **Zero dependencies.** A single Python 3 file using only the standard library (Python 3.8+). It runs on macOS and Linux.
+- **Zero dependencies.** A single Python 3 file using only the standard library (Python 3.9+). It runs on macOS and Linux.
 
 ## Install
 
